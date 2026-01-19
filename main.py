@@ -1,12 +1,12 @@
-from fastapi import FastAPI, Depends, Request
-from prometheus_client import make_asgi_app
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
 
 from app.mcp.tools import mcp
-from app.core.security import verify_token
 from app.services.data_service import data_service
 from config import settings
+from prometheus_client import make_asgi_app
 
 # 로거 설정
 logger = logging.getLogger("audit")
@@ -20,7 +20,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.critical(f"Failed to initialize data source: {e}")
     yield
-    # 종료 시 정리 로직 (필요 시)
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -32,7 +31,7 @@ app = FastAPI(
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 
-# 2. 헬스 체크 & Readiness Probe (운영성 개선)
+# 2. 헬스 체크 & Readiness Probe
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
@@ -40,16 +39,30 @@ async def health_check():
 @app.get("/ready")
 async def readiness_check():
     try:
-        # DB 연결 테스트 (간단한 쿼리)
         await data_service.get_user_by_id(1)
         return {"status": "ready"}
     except Exception:
         return {"status": "not_ready"}, 503
 
-# 3. SSE Endpoint 마운트 (보안 적용)
-# FastMCP의 mount_sse를 사용하여 /mcp/sse, /mcp/messages 엔드포인트 자동 생성
-# verify_token 의존성을 주입하여 모든 요청에 대해 인증 강제
-mcp.mount_sse(app, "/mcp", dependencies=[Depends(verify_token)])
+# 3. 인증 미들웨어 (Mount된 앱 보호용)
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    # /mcp 경로로 시작하는 요청에 대해서만 토큰 검사
+    if request.url.path.startswith("/mcp"):
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or auth_header != f"Bearer {settings.API_TOKEN}":
+            return JSONResponse(
+                status_code=401, 
+                content={"detail": "Invalid or missing authentication credentials"}
+            )
+    
+    response = await call_next(request)
+    return response
+
+# 4. MCP SSE 앱 마운트
+# mcp.sse_app()은 Starlette 앱을 반환하며, 이를 /mcp 경로에 마운트합니다.
+# 결과적으로 /mcp/sse, /mcp/messages 엔드포인트가 생성됩니다.
+app.mount("/mcp", mcp.sse_app())
 
 if __name__ == "__main__":
     import uvicorn
